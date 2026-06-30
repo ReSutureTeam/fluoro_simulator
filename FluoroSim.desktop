@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=FluoroSim
+Comment=Launch the FluoroSim simulation window with the web control panel
+Exec=/home/benknapp95/fluoro_simulator/launch_fluoro.sh
+Icon=/home/benknapp95/fluoro_simulator/static/logosign_white.png
+Path=/home/benknapp95/fluoro_simulator
+Terminal=false
+Categories=Education;Science;
+StartupNotify=true
