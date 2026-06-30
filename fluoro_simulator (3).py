@@ -10,6 +10,11 @@ https://github.com/opencv/opencv/tree/master/samples/python
 Usage:
    fluoro_sim.py {<video device number>}
 
+A second, dark-themed CONTROLS window (logo + clickable buttons) mirrors the web
+control panel (fluoro_web.py): the same toggles and Fullscreen / Windowed / Quit
+actions, driven by mouse clicks. The keyboard shortcuts below still work and stay
+in sync with the on-screen buttons.
+
 Keyboard shortcuts:
    ESC - exit
    Space - Toggle Peddle
@@ -36,15 +41,178 @@ import threading                            # Imported for thread-safety (not di
 # This ensures the overlay image is found regardless of where the script is launched from.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OVERLAY_IMAGE = os.path.join(BASE_DIR, "skel.jpg")
+LOGO_IMAGE = os.path.join(BASE_DIR, "static", "logosign_white.png")
 print("Overlay path:", OVERLAY_IMAGE)
 
 # Linux input device path for the USB foot switch (PCsensor FootSwitch).
 # This path is used to detect physical pedal presses in real deployments.
 PEDAL_PATH = "/dev/input/by-id/usb-PCsensor-FootSwitch-event-kbd"
 
-# Global flag that tracks whether the foot pedal is currently pressed.
-# Set to True when the 'b' key is held (keyboard stand-in for the real pedal).
-pedal_pressed = False
+
+# ── Shared control state ──────────────────────────────────────────────────────
+# Single source of truth for the toggles/actions, shared by the keyboard handler,
+# the main loop, and the CONTROLS-window mouse callback. Mirrors fluoro_web.py's
+# `state` dict so both front-ends behave identically.
+state = {
+    "subtract": True,        # (2/1) background subtraction + inversion
+    "overlay": True,         # (1/5) anatomy overlay; off => full raw video
+    "equalize": True,        # (6) CLAHE histogram equalisation
+    "hud": True,             # (7) on-screen text HUD on the FLUORO view
+    "pedal_mode": False,     # (Space) only capture while the pedal is pressed
+    "pedal_pressed": False,  # latched pedal stand-in (also driven momentarily by 'b')
+    "fullscreen": False,     # (3/4) FLUORO window fullscreen vs. windowed
+    "quit": False,           # set by the Quit button / ESC to stop the loop
+}
+
+# Hit-boxes for the CONTROLS window, rebuilt every render as
+# (x, y, w, h, kind, name) tuples. kind is "toggle" or "action".
+ctrl_buttons = []
+
+
+# ── CONTROLS-window theme (BGR — matches the web panel's hex colours) ─────────
+C_BG       = (20, 15, 11)     # #0b0f14  page background
+C_BTN_BG   = (34, 26, 19)     # #131a22  button background
+C_BTN_BD   = (63, 50, 38)     # #26323f  button border
+C_ON_BG    = (42, 59, 16)     # #103b2a  active button background
+C_ON_BD    = (106, 183, 18)   # #12b76a  active button border
+C_ON_TX    = (182, 240, 122)  # #7af0b6  active button text
+C_TEXT     = (243, 237, 231)  # #e7edf3  normal text
+C_SUBTEXT  = (153, 138, 125)  # #7d8a99  ON/OFF sub-label
+C_QUIT_BG  = (22, 20, 42)     # #2a1416  quit button background
+C_QUIT_BD  = (39, 35, 91)     # #5b2327  quit button border
+C_QUIT_TX  = (154, 154, 255)  # #ff9a9a  quit button text
+C_DOT_OFF  = (56, 68, 240)    # #f04438  status dot (no live feed)
+C_DOT_ON   = (106, 183, 18)   # #12b76a  status dot (live)
+
+
+def rounded_rect(img, x, y, w, h, r, color, thickness=-1):
+    '''Draw a (optionally filled) rounded rectangle to approximate the web buttons.'''
+    if thickness < 0:
+        cv.rectangle(img, (x + r, y), (x + w - r, y + h), color, -1)
+        cv.rectangle(img, (x, y + r), (x + w, y + h - r), color, -1)
+        for cx, cy in ((x + r, y + r), (x + w - r, y + r), (x + r, y + h - r), (x + w - r, y + h - r)):
+            cv.circle(img, (cx, cy), r, color, -1, cv.LINE_AA)
+    else:
+        cv.line(img, (x + r, y), (x + w - r, y), color, thickness, cv.LINE_AA)
+        cv.line(img, (x + r, y + h), (x + w - r, y + h), color, thickness, cv.LINE_AA)
+        cv.line(img, (x, y + r), (x, y + h - r), color, thickness, cv.LINE_AA)
+        cv.line(img, (x + w, y + r), (x + w, y + h - r), color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + r, y + r), (r, r), 180, 0, 90, color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + w - r, y + r), (r, r), 270, 0, 90, color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + r, y + h - r), (r, r), 90, 0, 90, color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + w - r, y + h - r), (r, r), 0, 0, 90, color, thickness, cv.LINE_AA)
+
+
+def paste_rgba(dst, rgba, x, y, target_w):
+    '''Alpha-composite an (RGBA or BGR) image onto dst, scaled to target_w. Returns drawn height.'''
+    scale = target_w / float(rgba.shape[1])
+    tw = target_w
+    th = max(1, int(rgba.shape[0] * scale))
+    r = cv.resize(rgba, (tw, th), interpolation=cv.INTER_AREA)
+    if r.ndim == 3 and r.shape[2] == 4:
+        a = r[:, :, 3:4].astype(np.float32) / 255.0
+        bgr = r[:, :, :3].astype(np.float32)
+    else:
+        a = np.ones((th, tw, 1), np.float32)
+        bgr = r.reshape(th, tw, -1)[:, :, :3].astype(np.float32)
+    roi = dst[y:y + th, x:x + tw].astype(np.float32)
+    dst[y:y + th, x:x + tw] = (a * bgr + (1.0 - a) * roi).astype(np.uint8)
+    return th
+
+
+def draw_button(img, x, y, w, h, label, sub=None, on=False, variant="normal"):
+    '''Draw one themed button (fill + border + centred label, optional ON/OFF sub-label).'''
+    if variant == "quit":
+        bg, bd, tx = C_QUIT_BG, C_QUIT_BD, C_QUIT_TX
+    elif on:
+        bg, bd, tx = C_ON_BG, C_ON_BD, C_ON_TX
+    else:
+        bg, bd, tx = C_BTN_BG, C_BTN_BD, C_TEXT
+    rounded_rect(img, x, y, w, h, 12, bg, -1)
+    rounded_rect(img, x, y, w, h, 12, bd, 1)
+    font = cv.FONT_HERSHEY_SIMPLEX
+    if sub is None:
+        (lw, lh), _ = cv.getTextSize(label, font, 0.55, 1)
+        cv.putText(img, label, (x + (w - lw) // 2, y + (h + lh) // 2), font, 0.55, tx, 1, cv.LINE_AA)
+    else:
+        (lw, lh), _ = cv.getTextSize(label, font, 0.55, 1)
+        cv.putText(img, label, (x + (w - lw) // 2, y + h // 2 - 2), font, 0.55, tx, 1, cv.LINE_AA)
+        (sw, sh), _ = cv.getTextSize(sub, font, 0.42, 1)
+        cv.putText(img, sub, (x + (w - sw) // 2, y + h // 2 + 16), font, 0.42,
+                   tx if on else C_SUBTEXT, 1, cv.LINE_AA)
+
+
+def render_controls(logo, live):
+    '''Render the dark control panel (logo + button grid) and refresh ctrl_buttons hit-boxes.'''
+    global ctrl_buttons
+    W, m, gap, top_pad = 380, 16, 10, 18
+    bt, ba = 56, 52  # toggle / action button heights
+
+    lw = W - 2 * m
+    lh = int(logo.shape[0] * (lw / float(logo.shape[1]))) if logo is not None else 0
+    H = top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3 + ba + gap + ba + 16
+
+    img = np.full((H, W, 3), C_BG, np.uint8)
+    ctrl_buttons = []
+    y = top_pad
+
+    # Logo, centred across the full content width.
+    if logo is not None:
+        paste_rgba(img, logo, m, y, lw)
+    y += lh + 14
+
+    # Live-status dot + title, centred as a row.
+    title = "FluoroSim Controls"
+    font = cv.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv.getTextSize(title, font, 0.6, 1)
+    row_w = tw + 18
+    tx0 = (W - row_w) // 2
+    cv.circle(img, (tx0 + 5, y + 9), 5, C_DOT_ON if live else C_DOT_OFF, -1, cv.LINE_AA)
+    cv.putText(img, title, (tx0 + 18, y + 9 + th // 2), font, 0.6, C_TEXT, 1, cv.LINE_AA)
+    y += 26 + 14
+
+    # Toggle grid (2 columns), mirroring the web panel's toggles.
+    cw = (W - 2 * m - gap) // 2
+    toggles = [("Subtraction", "subtract"), ("Overlay", "overlay"),
+               ("Equalize", "equalize"), ("HUD", "hud"),
+               ("Pedal mode", "pedal_mode"), ("Pedal press", "pedal_pressed")]
+    for i, (label, key) in enumerate(toggles):
+        col, row = i % 2, i // 2
+        bx = m + col * (cw + gap)
+        by = y + row * (bt + gap)
+        on = bool(state[key])
+        draw_button(img, bx, by, cw, bt, label, "ON" if on else "OFF", on)
+        ctrl_buttons.append((bx, by, cw, bt, "toggle", key))
+    y += 3 * (bt + gap)
+
+    # Fullscreen / Windowed actions (highlighted to reflect the current mode).
+    draw_button(img, m, y, cw, ba, "Fullscreen", None, state["fullscreen"])
+    ctrl_buttons.append((m, y, cw, ba, "action", "fullscreen"))
+    draw_button(img, m + cw + gap, y, cw, ba, "Windowed", None, not state["fullscreen"])
+    ctrl_buttons.append((m + cw + gap, y, cw, ba, "action", "windowed"))
+    y += ba + gap
+
+    # Quit, full width.
+    draw_button(img, m, y, W - 2 * m, ba, "Quit simulator", None, False, "quit")
+    ctrl_buttons.append((m, y, W - 2 * m, ba, "action", "quit"))
+    return img
+
+
+def on_mouse(event, x, y, flags, param):
+    '''CONTROLS-window click handler — flip a toggle or fire an action into `state`.'''
+    if event != cv.EVENT_LBUTTONDOWN:
+        return
+    for (bx, by, bw, bh, kind, name) in ctrl_buttons:
+        if bx <= x < bx + bw and by <= y < by + bh:
+            if kind == "toggle":
+                state[name] = not state[name]
+            elif name == "fullscreen":
+                state["fullscreen"] = True
+            elif name == "windowed":
+                state["fullscreen"] = False
+            elif name == "quit":
+                state["quit"] = True
+            break
 
 
 def create_capture(source=0):
@@ -182,6 +350,17 @@ if __name__ == '__main__':
     cv.namedWindow("FLUORO", cv.WND_PROP_FULLSCREEN)
     cv.setWindowProperty("FLUORO", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
 
+    # ── Control panel window ──────────────────────────────────────────────────
+    # A separate, auto-sized window holding the logo + clickable buttons. Clicks
+    # are routed through on_mouse into the shared `state` dict; the FLUORO window
+    # stays a clean simulation view.
+    cv.namedWindow("CONTROLS", cv.WINDOW_AUTOSIZE)
+    cv.setMouseCallback("CONTROLS", on_mouse)
+    cv.moveWindow("CONTROLS", 20, 20)
+    logo = cv.imread(LOGO_IMAGE, cv.IMREAD_UNCHANGED)
+    if logo is None:
+        print("Warning: logo not found at", LOGO_IMAGE)
+
     # ── Load the anatomy overlay image ────────────────────────────────────────
     # skel.jpg is a static skeletal/anatomy image that is composited onto the
     # live feed to mimic how a fluoroscope shows anatomy underneath the subject.
@@ -267,18 +446,17 @@ if __name__ == '__main__':
     # The main loop submits frames to the pool and drains finished results from this queue.
     pending = deque()
 
-    # ── Mode flags (toggled by keyboard shortcuts) ────────────────────────────
-    subtract_mode = True   # Subtract accumulated background from each frame and invert
+    # ── Mode flags ────────────────────────────────────────────────────────────
+    # The user-facing toggles live in the shared `state` dict (driven by both the
+    # keyboard and the CONTROLS buttons). threaded_mode stays a private local.
     threaded_mode = True   # Use the thread pool (False = process synchronously)
-    overlay_mode  = True   # Composite the anatomy overlay onto the frame
-    equalize_mode = True   # Apply histogram equalisation
-    peddle_mode   = False  # When True, only capture frames while the pedal is pressed
-    hud_mode      = True   # Show the on-screen text HUD
 
     # ── Background model ──────────────────────────────────────────────────────
     # `background` is a float32 accumulator updated each frame via accumulateWeighted.
     # Initialised to None; seeded from the first captured frame.
     background = None
+    applied_fullscreen = None  # last fullscreen state pushed to the FLUORO window
+    live = False               # True once a frame has been read (drives the status dot)
 
     # Learning rate for cv.accumulateWeighted: background = (1-alpha)*background + alpha*frame
     # 0.05 means the background adapts slowly — a new object takes ~20 frames to be absorbed.
@@ -295,12 +473,17 @@ if __name__ == '__main__':
         # Mask to 8 bits to avoid issues with extended key codes on some platforms.
         key = cv.waitKey(1) & 0xFF
 
-        # 'b' acts as a keyboard stand-in for the physical foot pedal.
-        # The real pedal would set pedal_pressed via a separate input thread reading PEDAL_PATH.
-        if key == ord('b'):
-            pedal_pressed = True
-        else:
-            pedal_pressed = False
+        # 'b' is a momentary keyboard stand-in for the physical foot pedal; the
+        # "Pedal press" button latches state["pedal_pressed"]. Either one counts.
+        key_pedal = (key == ord('b'))
+        pedal_down = state["pedal_pressed"] or key_pedal
+
+        # Keep the FLUORO window's fullscreen state in sync with the toggle.
+        if state["fullscreen"] != applied_fullscreen:
+            cv.setWindowProperty(
+                "FLUORO", cv.WND_PROP_FULLSCREEN,
+                cv.WINDOW_FULLSCREEN if state["fullscreen"] else cv.WINDOW_NORMAL)
+            applied_fullscreen = state["fullscreen"]
 
         # ── Drain completed frames from the thread pool ───────────────────────
         # Check the front of the queue; pop and display frames that are done.
@@ -311,19 +494,19 @@ if __name__ == '__main__':
             latency.update(clock() - t0)
 
             # ── HUD overlay ───────────────────────────────────────────────────
-            if hud_mode:
+            if state["hud"]:
                 # Draw current mode states in the top-left corner of the frame.
                 # Lines are spaced 20px apart so they don't overlap.
-                draw_str(res, (20, 20), "(1)Toggle Subtraction : " + str(subtract_mode) + "  (3)Fullscreen (4)Windowed")
-                draw_str(res, (20, 40), "(2)Toggle Overlay     : " + str(overlay_mode)  + "   (5)Toggle Background (6)EqualizeHist")
-                draw_str(res, (20, 60), "(Space) Toggle Peddle : " + str(peddle_mode)   + "  (7)Toggle HUD")
+                draw_str(res, (20, 20), "(1)Toggle Subtraction : " + str(state["subtract"]) + "  (3)Fullscreen (4)Windowed")
+                draw_str(res, (20, 40), "(2)Toggle Overlay     : " + str(state["overlay"])  + "   (5)Toggle Background (6)EqualizeHist")
+                draw_str(res, (20, 60), "(Space) Toggle Peddle : " + str(state["pedal_mode"]) + "  (7)Toggle HUD")
                 # Uncomment below to show timing diagnostics in the HUD:
                 #draw_str(res, (20, 80), "latency        :  %.1f ms" % (latency.value*1000))
                 #draw_str(res, (20, 60), "frame interval :  %.1f ms" % (frame_interval.value*1000))
                 #draw_str(res, (20, 80), "threaded      :  " + str(threaded_mode))
 
             # Show "PEDAL ACTIVE" near the bottom when the pedal is pressed
-            if pedal_pressed:
+            if pedal_down:
                 draw_str(res, (20, 450), "PEDAL ACTIVE")
 
             # Push the finished frame to the display window
@@ -335,11 +518,12 @@ if __name__ == '__main__':
         if len(pending) < threadn:
 
             # In pedal mode, only grab a frame when the pedal is pressed.
-            # When pedal mode is off, capture continuously (peddle_mode == False).
-            if pedal_pressed or peddle_mode == False:
+            # When pedal mode is off, capture continuously.
+            if pedal_down or state["pedal_mode"] == False:
                 ret, frame = cap.read()
                 if not ret:
                     raise RuntimeError("Failed to read from camera")
+                live = True
 
                 # Convert the colour frame to grayscale.
                 # All subsequent processing is single-channel for simplicity and speed.
@@ -366,7 +550,7 @@ if __name__ == '__main__':
                 # Convert the float32 background accumulator to uint8 for subtraction.
                 bg_uint8 = cv.convertScaleAbs(background)
 
-                if subtract_mode:
+                if state["subtract"]:
                     # absdiff produces a difference image: pixels that match the
                     # background are near 0; pixels that differ (vasculature) are brighter.
                     frame_gray = cv.absdiff(frame_gray, bg_uint8)
@@ -389,48 +573,55 @@ if __name__ == '__main__':
                 if threaded_mode:
                     # Send a copy of the frame to avoid a race condition: the main loop
                     # may modify frame_gray before the thread reads it without the copy.
-                    task = pool.apply_async(process_frame, (frame_gray.copy(), frame_raw.copy(), t, subtract_mode, overlay_mode, equalize_mode))
+                    task = pool.apply_async(process_frame, (frame_gray.copy(), frame_raw.copy(), t, state["subtract"], state["overlay"], state["equalize"]))
                 else:
                     # Wrap the synchronous result in DummyTask so the drain loop above
                     # can call .ready() and .get() on it without any special casing.
-                    task = DummyTask(process_frame(frame_gray, frame_raw, t, subtract_mode, overlay_mode, equalize_mode))
+                    task = DummyTask(process_frame(frame_gray, frame_raw, t, state["subtract"], state["overlay"], state["equalize"]))
 
                 pending.append(task)
 
+        # ── Refresh the control panel ──────────────────────────────────────────
+        # Rendered every iteration so the button states track the keyboard and the
+        # status dot reflects whether a live frame is flowing.
+        cv.imshow("CONTROLS", render_controls(logo, live))
+
         # ── Keyboard shortcut handling ─────────────────────────────────────────
         # Second waitKey call at the bottom of the loop catches presses that
-        # arrive during the frame processing work above.
+        # arrive during the frame processing work above. Shortcuts mutate the same
+        # `state` dict the buttons do, so the two stay in lock-step.
         ch = cv.waitKey(1)
 
         # Space — toggle pedal mode (continuous capture vs. pedal-gated capture)
-        # Uncomment the threaded_mode line if you want Space to toggle threading instead:
-        #if ch == ord(' '):
-        #    threaded_mode = not threaded_mode
         if ch == ord(' '):
-            peddle_mode = not peddle_mode
+            state["pedal_mode"] = not state["pedal_mode"]
 
         if ch == 49:   # '1' — toggle background subtraction on/off
-            subtract_mode = not subtract_mode
+            state["subtract"] = not state["subtract"]
 
         if ch == 50:   # '2' — toggle anatomy overlay compositing on/off
-            overlay_mode = not overlay_mode
+            state["overlay"] = not state["overlay"]
 
         if ch == 51:   # '3' — switch display window to fullscreen
-            cv.setWindowProperty("FLUORO", cv.WND_PROP_FULLSCREEN, cv.WINDOW_FULLSCREEN)
+            state["fullscreen"] = True
 
         if ch == 52:   # '4' — return display window to normal (windowed) mode
-            cv.setWindowProperty("FLUORO", cv.WND_PROP_FULLSCREEN, cv.WINDOW_NORMAL)
+            state["fullscreen"] = False
 
         if ch == 53:   # '5' — toggle the background overlay off/on (off = full raw video)
-            overlay_mode = not overlay_mode
+            state["overlay"] = not state["overlay"]
 
         if ch == 54:   # '6' — toggle histogram equalisation on/off
-            equalize_mode = not equalize_mode
+            state["equalize"] = not state["equalize"]
 
         if ch == 55:   # '7' — toggle the on-screen HUD on/off
-            hud_mode = not hud_mode
+            state["hud"] = not state["hud"]
 
         if ch == 27:   # ESC — exit the main loop
+            state["quit"] = True
+
+        # Quit requested by ESC or the Quit button.
+        if state["quit"]:
             break
 
 # Release all OpenCV windows after the loop exits

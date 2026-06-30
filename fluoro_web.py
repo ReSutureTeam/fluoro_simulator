@@ -113,9 +113,11 @@ PAGE = """
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
          background: #0b0f14; color: #e7edf3; }
-  header { padding: 14px 16px; display: flex; align-items: center; gap: 10px;
+  header { padding: 18px 16px; display: flex; flex-direction: column; align-items: center; gap: 10px;
            border-bottom: 1px solid #1d2733; position: sticky; top: 0; background: #0b0f14; }
+  header .titlerow { display: flex; align-items: center; gap: 10px; }
   header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header img.logo { width: min(520px, 88%); height: auto; display: block; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: #f04438; }
   .dot.live { background: #12b76a; box-shadow: 0 0 8px #12b76a; }
   main { padding: 16px; max-width: 720px; margin: 0 auto; }
@@ -138,8 +140,11 @@ PAGE = """
 </head>
 <body>
 <header>
-  <span id="dot" class="dot"></span>
-  <h1>FluoroSim Controls</h1>
+  <img class="logo" src="/static/logosign_white.png" alt="FluoroSim logo">
+  <div class="titlerow">
+    <span id="dot" class="dot"></span>
+    <h1>FluoroSim Controls</h1>
+  </div>
 </header>
 <main>
   <div class="preview"><img id="feed" src="/video_feed" alt="live preview"></div>
