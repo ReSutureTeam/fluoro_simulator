@@ -5,3 +5,6 @@ key.pem
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Runtime log from the desktop launcher
+launch.log

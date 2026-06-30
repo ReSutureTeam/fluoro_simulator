@@ -61,6 +61,7 @@ from flask import Flask, Response, jsonify, render_template_string
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OVERLAY_IMAGE = os.path.join(BASE_DIR, "skel.jpg")
+LOGO_IMAGE = os.path.join(BASE_DIR, "static", "logosign_white.png")
 
 # Brightness threshold above which a pixel is treated as bright "white background"
 # and composited mostly from the overlay. (Mirrors fluoro_simulator (3).py.)
@@ -124,8 +125,26 @@ PAGE = """
   .preview { width: 100%; background: #000; border-radius: 12px; overflow: hidden;
              border: 1px solid #1d2733; aspect-ratio: 4 / 3; display: flex; }
   .preview img { width: 100%; height: 100%; object-fit: contain; }
-  .preview:fullscreen, .preview:-webkit-full-screen {
-      width: 100vw; height: 100vh; border: 0; border-radius: 0; aspect-ratio: auto; }
+  /* Fullscreen: stack the video on top (filling the available space) and a
+     compact, full-width control strip below it — the controls never cover the
+     video, and the video only loses the strip's height. Leaving fullscreen
+     returns everything to the normal stacked layout. */
+  .stage:fullscreen, .stage:-webkit-full-screen {
+      display: flex; flex-direction: column; width: 100vw; height: 100vh; background: #000; }
+  .stage:fullscreen .preview, .stage:-webkit-full-screen .preview {
+      flex: 1 1 auto; min-height: 0; width: 100%;
+      border: 0; border-radius: 0; aspect-ratio: auto; }
+  .stage:fullscreen .panel, .stage:-webkit-full-screen .panel {
+      flex: 0 0 auto; padding: 10px 12px; background: #0b0f14; border-top: 1px solid #1d2733; }
+  /* Lay the buttons out horizontally so the strip stays short. */
+  .stage:fullscreen .panel .grid, .stage:-webkit-full-screen .panel .grid {
+      grid-template-columns: repeat(6, 1fr); margin-top: 0; }
+  .stage:fullscreen .panel .actions, .stage:-webkit-full-screen .panel .actions {
+      grid-template-columns: repeat(3, 1fr); margin-top: 8px; }
+  .stage:fullscreen .panel button, .stage:-webkit-full-screen .panel button {
+      padding: 10px 8px; font-size: 14px; }
+  .stage:fullscreen .panel button.quit, .stage:-webkit-full-screen .panel button.quit {
+      grid-column: auto; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
   button { font-size: 16px; padding: 16px 12px; border-radius: 12px; border: 1px solid #26323f;
            background: #131a22; color: #e7edf3; cursor: pointer; font-weight: 600;
@@ -147,21 +166,25 @@ PAGE = """
   </div>
 </header>
 <main>
-  <div class="preview"><img id="feed" src="/video_feed" alt="live preview"></div>
+  <div class="stage" id="stage">
+    <div class="preview"><img id="feed" src="/video_feed" alt="live preview"></div>
 
-  <div class="grid" id="toggles">
-    <button class="toggle" data-toggle="subtract">Subtraction<span class="st">—</span></button>
-    <button class="toggle" data-toggle="overlay">Overlay<span class="st">—</span></button>
-    <button class="toggle" data-toggle="equalize">Equalize<span class="st">—</span></button>
-    <button class="toggle" data-toggle="hud">HUD<span class="st">—</span></button>
-    <button class="toggle" data-toggle="pedal_mode">Pedal mode<span class="st">—</span></button>
-    <button class="toggle" data-toggle="pedal_pressed">Pedal press<span class="st">—</span></button>
-  </div>
+    <div class="panel">
+      <div class="grid" id="toggles">
+        <button class="toggle" data-toggle="subtract">Subtraction<span class="st">—</span></button>
+        <button class="toggle" data-toggle="overlay">Overlay<span class="st">—</span></button>
+        <button class="toggle" data-toggle="equalize">Equalize<span class="st">—</span></button>
+        <button class="toggle" data-toggle="hud">HUD<span class="st">—</span></button>
+        <button class="toggle" data-toggle="pedal_mode">Pedal mode<span class="st">—</span></button>
+        <button class="toggle" data-toggle="pedal_pressed">Pedal press<span class="st">—</span></button>
+      </div>
 
-  <div class="actions">
-    <button class="fsbtn" data-action="fullscreen" data-fs="1">Fullscreen</button>
-    <button class="fsbtn" data-action="windowed" data-fs="0">Windowed</button>
-    <button class="quit" data-action="quit">Quit simulator</button>
+      <div class="actions">
+        <button class="fsbtn" data-action="fullscreen" data-fs="1">Fullscreen</button>
+        <button class="fsbtn" data-action="windowed" data-fs="0">Windowed</button>
+        <button class="quit" data-action="quit">Quit simulator</button>
+      </div>
+    </div>
   </div>
 
   <p class="hint">Overlay off shows the full raw video. Pedal press only matters when Pedal mode is on.</p>
@@ -188,8 +211,9 @@ document.querySelectorAll('[data-toggle]').forEach(function (b) {
   });
 });
 function browserFullscreen(on) {
-  // Fullscreen the live preview in THIS browser (must run inside a click handler).
-  var el = document.querySelector('.preview');
+  // Fullscreen the whole stage (preview + overlaid controls) in THIS browser
+  // (must run inside a click handler).
+  var el = document.getElementById('stage');
   try {
     if (on) {
       var req = el.requestFullscreen || el.webkitRequestFullscreen;
@@ -310,6 +334,213 @@ def draw_str(dst, target, s):
     cv.putText(dst, s, (x, y), cv.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 255), lineType=cv.LINE_AA)
 
 
+# ── On-screen control panel ───────────────────────────────────────────────────
+# The same dark, clickable panel as fluoro_simulator (3).py, drawn on-screen next
+# to / below the FLUORO window so the Pi has buttons even without a browser. It
+# drives the same thread-safe `state` the web handlers use, so the on-screen
+# buttons, the keyboard, and remote clients all stay in sync.
+
+# Theme (BGR — matches the web panel's hex colours).
+C_BG       = (20, 15, 11)     # #0b0f14
+C_BTN_BG   = (34, 26, 19)     # #131a22
+C_BTN_BD   = (63, 50, 38)     # #26323f
+C_ON_BG    = (42, 59, 16)     # #103b2a
+C_ON_BD    = (106, 183, 18)   # #12b76a
+C_ON_TX    = (182, 240, 122)  # #7af0b6
+C_TEXT     = (243, 237, 231)  # #e7edf3
+C_SUBTEXT  = (153, 138, 125)  # #7d8a99
+C_QUIT_BG  = (22, 20, 42)     # #2a1416
+C_QUIT_BD  = (39, 35, 91)     # #5b2327
+C_QUIT_TX  = (154, 154, 255)  # #ff9a9a
+C_DOT_OFF  = (56, 68, 240)    # #f04438
+C_DOT_ON   = (106, 183, 18)   # #12b76a
+
+# Button hit-boxes (x, y, w, h, kind, name), rebuilt every render. `ctrl_buttons`
+# are positions inside the separate CONTROLS window (windowed); `overlay_buttons`
+# are positions on the FLUORO frame when the bar is stacked below it (fullscreen).
+ctrl_buttons = []
+overlay_buttons = []
+
+
+def rounded_rect(img, x, y, w, h, r, color, thickness=-1):
+    '''Draw a (optionally filled) rounded rectangle to approximate the web buttons.'''
+    if thickness < 0:
+        cv.rectangle(img, (x + r, y), (x + w - r, y + h), color, -1)
+        cv.rectangle(img, (x, y + r), (x + w, y + h - r), color, -1)
+        for cx, cy in ((x + r, y + r), (x + w - r, y + r), (x + r, y + h - r), (x + w - r, y + h - r)):
+            cv.circle(img, (cx, cy), r, color, -1, cv.LINE_AA)
+    else:
+        cv.line(img, (x + r, y), (x + w - r, y), color, thickness, cv.LINE_AA)
+        cv.line(img, (x + r, y + h), (x + w - r, y + h), color, thickness, cv.LINE_AA)
+        cv.line(img, (x, y + r), (x, y + h - r), color, thickness, cv.LINE_AA)
+        cv.line(img, (x + w, y + r), (x + w, y + h - r), color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + r, y + r), (r, r), 180, 0, 90, color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + w - r, y + r), (r, r), 270, 0, 90, color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + r, y + h - r), (r, r), 90, 0, 90, color, thickness, cv.LINE_AA)
+        cv.ellipse(img, (x + w - r, y + h - r), (r, r), 0, 0, 90, color, thickness, cv.LINE_AA)
+
+
+def paste_rgba(dst, rgba, x, y, target_w):
+    '''Alpha-composite an (RGBA or BGR) image onto dst, scaled to target_w. Returns drawn height.'''
+    scale = target_w / float(rgba.shape[1])
+    tw = target_w
+    th = max(1, int(rgba.shape[0] * scale))
+    r = cv.resize(rgba, (tw, th), interpolation=cv.INTER_AREA)
+    if r.ndim == 3 and r.shape[2] == 4:
+        a = r[:, :, 3:4].astype(np.float32) / 255.0
+        bgr = r[:, :, :3].astype(np.float32)
+    else:
+        a = np.ones((th, tw, 1), np.float32)
+        bgr = r.reshape(th, tw, -1)[:, :, :3].astype(np.float32)
+    roi = dst[y:y + th, x:x + tw].astype(np.float32)
+    dst[y:y + th, x:x + tw] = (a * bgr + (1.0 - a) * roi).astype(np.uint8)
+    return th
+
+
+def draw_button(img, x, y, w, h, label, sub=None, on=False, variant="normal"):
+    '''Draw one themed button (fill + border + centred label, optional ON/OFF sub-label).'''
+    if variant == "quit":
+        bg, bd, tx = C_QUIT_BG, C_QUIT_BD, C_QUIT_TX
+    elif on:
+        bg, bd, tx = C_ON_BG, C_ON_BD, C_ON_TX
+    else:
+        bg, bd, tx = C_BTN_BG, C_BTN_BD, C_TEXT
+    rounded_rect(img, x, y, w, h, 12, bg, -1)
+    rounded_rect(img, x, y, w, h, 12, bd, 1)
+    font = cv.FONT_HERSHEY_SIMPLEX
+    if sub is None:
+        (lw, lh), _ = cv.getTextSize(label, font, 0.55, 1)
+        cv.putText(img, label, (x + (w - lw) // 2, y + (h + lh) // 2), font, 0.55, tx, 1, cv.LINE_AA)
+    else:
+        (lw, lh), _ = cv.getTextSize(label, font, 0.55, 1)
+        cv.putText(img, label, (x + (w - lw) // 2, y + h // 2 - 2), font, 0.55, tx, 1, cv.LINE_AA)
+        (sw, sh), _ = cv.getTextSize(sub, font, 0.42, 1)
+        cv.putText(img, sub, (x + (w - sw) // 2, y + h // 2 + 16), font, 0.42,
+                   tx if on else C_SUBTEXT, 1, cv.LINE_AA)
+
+
+def render_controls(s, logo, live):
+    '''Render the vertical control panel (logo + button grid) for the CONTROLS window.
+
+    Returns (image, buttons) with hit-boxes relative to the panel's top-left.
+    `s` is a state snapshot.
+    '''
+    W, m, gap, top_pad = 380, 16, 10, 18
+    bt, ba = 56, 52
+
+    lw = W - 2 * m
+    lh = int(logo.shape[0] * (lw / float(logo.shape[1]))) if logo is not None else 0
+    H = top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3 + ba + gap + ba + 16
+
+    img = np.full((H, W, 3), C_BG, np.uint8)
+    buttons = []
+    y = top_pad
+
+    if logo is not None:
+        paste_rgba(img, logo, m, y, lw)
+    y += lh + 14
+
+    title = "FluoroSim Controls"
+    font = cv.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv.getTextSize(title, font, 0.6, 1)
+    tx0 = (W - (tw + 18)) // 2
+    cv.circle(img, (tx0 + 5, y + 9), 5, C_DOT_ON if live else C_DOT_OFF, -1, cv.LINE_AA)
+    cv.putText(img, title, (tx0 + 18, y + 9 + th // 2), font, 0.6, C_TEXT, 1, cv.LINE_AA)
+    y += 26 + 14
+
+    cw = (W - 2 * m - gap) // 2
+    toggles = [("Subtraction", "subtract"), ("Overlay", "overlay"),
+               ("Equalize", "equalize"), ("HUD", "hud"),
+               ("Pedal mode", "pedal_mode"), ("Pedal press", "pedal_pressed")]
+    for i, (label, key) in enumerate(toggles):
+        col, row = i % 2, i // 2
+        bx = m + col * (cw + gap)
+        by = y + row * (bt + gap)
+        on = bool(s[key])
+        draw_button(img, bx, by, cw, bt, label, "ON" if on else "OFF", on)
+        buttons.append((bx, by, cw, bt, "toggle", key))
+    y += 3 * (bt + gap)
+
+    draw_button(img, m, y, cw, ba, "Fullscreen", None, s["fullscreen"])
+    buttons.append((m, y, cw, ba, "action", "fullscreen"))
+    draw_button(img, m + cw + gap, y, cw, ba, "Windowed", None, not s["fullscreen"])
+    buttons.append((m + cw + gap, y, cw, ba, "action", "windowed"))
+    y += ba + gap
+
+    draw_button(img, m, y, W - 2 * m, ba, "Quit simulator", None, False, "quit")
+    buttons.append((m, y, W - 2 * m, ba, "action", "quit"))
+    return img, buttons
+
+
+def render_control_bar(s, width, live):
+    '''Render a short, full-width control strip stacked below the video in fullscreen.
+
+    Returns (image, buttons) with hit-boxes relative to the bar's top-left.
+    '''
+    pad, gap, bh = 6, 6, 34
+    bar_h = pad + bh + gap + bh + pad
+    img = np.full((bar_h, width, 3), C_BG, np.uint8)
+    cv.line(img, (0, 0), (width, 0), C_BTN_BD, 1, cv.LINE_AA)
+    buttons = []
+
+    toggles = [("Subtraction", "subtract"), ("Overlay", "overlay"),
+               ("Equalize", "equalize"), ("HUD", "hud"),
+               ("Pedal mode", "pedal_mode"), ("Pedal press", "pedal_pressed")]
+    cw = (width - 2 * pad - 5 * gap) // 6
+    y = pad
+    for i, (label, key) in enumerate(toggles):
+        bx = pad + i * (cw + gap)
+        draw_button(img, bx, y, cw, bh, label, None, bool(s[key]))
+        buttons.append((bx, y, cw, bh, "toggle", key))
+
+    y += bh + gap
+    aw = (width - 2 * pad - 2 * gap) // 3
+    draw_button(img, pad, y, aw, bh, "Fullscreen", None, s["fullscreen"])
+    buttons.append((pad, y, aw, bh, "action", "fullscreen"))
+    draw_button(img, pad + aw + gap, y, aw, bh, "Windowed", None, not s["fullscreen"])
+    buttons.append((pad + aw + gap, y, aw, bh, "action", "windowed"))
+    draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Quit simulator", None, False, "quit")
+    buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "quit"))
+    return img, buttons
+
+
+def apply_button(kind, name):
+    '''Apply an on-screen button press to the shared `state` (under state_lock).'''
+    with state_lock:
+        if kind == "toggle":
+            state[name] = not state[name]
+        elif name == "fullscreen":
+            state["fullscreen"] = True
+        elif name == "windowed":
+            state["fullscreen"] = False
+        elif name == "quit":
+            state["quit"] = True
+
+
+def _hit(buttons, x, y):
+    '''Return the (kind, name) of the button containing (x, y), or None.'''
+    for (bx, by, bw, bh, kind, name) in buttons:
+        if bx <= x < bx + bw and by <= y < by + bh:
+            return kind, name
+    return None
+
+
+def on_mouse_controls(event, x, y, flags, param):
+    '''Click handler for the separate CONTROLS window (windowed mode).'''
+    if event == cv.EVENT_LBUTTONDOWN:
+        hit = _hit(ctrl_buttons, x, y)
+        if hit:
+            apply_button(*hit)
+
+
+def on_mouse_fluoro(event, x, y, flags, param):
+    '''Click handler for buttons stacked below the video (fullscreen mode).'''
+    if event == cv.EVENT_LBUTTONDOWN:
+        hit = _hit(overlay_buttons, x, y)
+        if hit:
+            apply_button(*hit)
+
+
 def run_simulation(cam_index, show_window):
     '''Main capture/process/display loop — runs on the main thread until quit.
 
@@ -334,24 +565,47 @@ def run_simulation(cam_index, show_window):
         raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
     overlay = cv.cvtColor(overlay, cv.COLOR_RGB2GRAY)
 
+    # On-screen control panel: the logo image and a helper to (re)open the
+    # separate CONTROLS window used in windowed mode.
+    logo = cv.imread(LOGO_IMAGE, cv.IMREAD_UNCHANGED) if show_window else None
+
+    def show_controls_window():
+        cv.namedWindow("CONTROLS", cv.WINDOW_AUTOSIZE)
+        cv.setMouseCallback("CONTROLS", on_mouse_controls)
+        cv.moveWindow("CONTROLS", 20, 20)
+
     if show_window:
         cv.namedWindow("FLUORO", cv.WND_PROP_FULLSCREEN)
         cv.setWindowProperty("FLUORO", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
+        # Clicks on the FLUORO window only matter in fullscreen, where the control
+        # bar is stacked below the video (see overlay_buttons).
+        cv.setMouseCallback("FLUORO", on_mouse_fluoro)
+        if logo is None:
+            print("Warning: logo not found at", LOGO_IMAGE)
 
     background = None          # float32 running-average background model
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     res = None                 # last processed frame (shown + streamed)
+    live = False               # True once a frame has been read (drives the status dot)
 
     while True:
         s = get_state_snapshot()
         if s["quit"]:
             break
 
-        # Keep the OpenCV window's fullscreen state in sync with the web toggle.
+        # Keep the OpenCV window's fullscreen state in sync with the toggle, and
+        # move the on-screen controls between the separate CONTROLS window
+        # (windowed) and a bar stacked below the video (fullscreen).
         if show_window and s["fullscreen"] != applied_fullscreen:
             cv.setWindowProperty(
                 "FLUORO", cv.WND_PROP_FULLSCREEN,
                 cv.WINDOW_FULLSCREEN if s["fullscreen"] else cv.WINDOW_NORMAL)
+            if s["fullscreen"]:
+                if applied_fullscreen is not None:   # close the window if it was open
+                    cv.destroyWindow("CONTROLS")
+            else:
+                show_controls_window()
+                overlay_buttons[:] = []
             applied_fullscreen = s["fullscreen"]
 
         # Keyboard shortcuts still work on the FLUORO window.
@@ -374,6 +628,7 @@ def run_simulation(cam_index, show_window):
             if not ret:
                 time.sleep(0.01)
                 continue
+            live = True
 
             frame_gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
             frame_raw = frame_gray.copy()  # untouched copy shown when the overlay is off
@@ -409,7 +664,22 @@ def run_simulation(cam_index, show_window):
 
         if res is not None:
             if show_window:
-                cv.imshow("FLUORO", res)
+                if s["fullscreen"]:
+                    # Stack the video on top and a thin control bar below it.
+                    vid = cv.cvtColor(res, cv.COLOR_GRAY2BGR) if res.ndim == 2 else res
+                    bar, bbtns = render_control_bar(s, vid.shape[1], live)
+                    composite = np.vstack([vid, bar])
+                    overlay_buttons[:] = [(x, y + vid.shape[0], w, h, k, n)
+                                          for (x, y, w, h, k, n) in bbtns]
+                    cv.imshow("FLUORO", composite)
+                else:
+                    # Clean video in FLUORO, the vertical panel in CONTROLS.
+                    panel, btns = render_controls(s, logo, live)
+                    ctrl_buttons[:] = btns
+                    cv.imshow("CONTROLS", panel)
+                    cv.imshow("FLUORO", res)
+            # The web MJPEG preview always streams the clean frame (the browser has
+            # its own HTML buttons), so encode `res`, not the composited view.
             ok, jpg = cv.imencode(".jpg", res, [cv.IMWRITE_JPEG_QUALITY, 80])
             if ok:
                 with _latest_lock:

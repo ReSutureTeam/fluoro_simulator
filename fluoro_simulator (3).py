@@ -64,9 +64,12 @@ state = {
     "quit": False,           # set by the Quit button / ESC to stop the loop
 }
 
-# Hit-boxes for the CONTROLS window, rebuilt every render as
-# (x, y, w, h, kind, name) tuples. kind is "toggle" or "action".
+# Button hit-boxes, rebuilt every render as (x, y, w, h, kind, name) tuples
+# (kind is "toggle" or "action"). `ctrl_buttons` hold positions inside the
+# separate CONTROLS window (windowed mode); `overlay_buttons` hold positions on
+# the FLUORO frame when the panel is composited as a fullscreen overlay.
 ctrl_buttons = []
+overlay_buttons = []
 
 
 # ── CONTROLS-window theme (BGR — matches the web panel's hex colours) ─────────
@@ -143,8 +146,13 @@ def draw_button(img, x, y, w, h, label, sub=None, on=False, variant="normal"):
 
 
 def render_controls(logo, live):
-    '''Render the dark control panel (logo + button grid) and refresh ctrl_buttons hit-boxes.'''
-    global ctrl_buttons
+    '''Render the dark control panel (logo + button grid).
+
+    Returns (image, buttons) where buttons is a list of (x, y, w, h, kind, name)
+    hit-boxes relative to the panel's top-left. The caller places the panel —
+    its own CONTROLS window when windowed, or composited onto the FLUORO frame
+    when fullscreen — and offsets the hit-boxes to match.
+    '''
     W, m, gap, top_pad = 380, 16, 10, 18
     bt, ba = 56, 52  # toggle / action button heights
 
@@ -153,7 +161,7 @@ def render_controls(logo, live):
     H = top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3 + ba + gap + ba + 16
 
     img = np.full((H, W, 3), C_BG, np.uint8)
-    ctrl_buttons = []
+    buttons = []
     y = top_pad
 
     # Logo, centred across the full content width.
@@ -182,37 +190,95 @@ def render_controls(logo, live):
         by = y + row * (bt + gap)
         on = bool(state[key])
         draw_button(img, bx, by, cw, bt, label, "ON" if on else "OFF", on)
-        ctrl_buttons.append((bx, by, cw, bt, "toggle", key))
+        buttons.append((bx, by, cw, bt, "toggle", key))
     y += 3 * (bt + gap)
 
     # Fullscreen / Windowed actions (highlighted to reflect the current mode).
     draw_button(img, m, y, cw, ba, "Fullscreen", None, state["fullscreen"])
-    ctrl_buttons.append((m, y, cw, ba, "action", "fullscreen"))
+    buttons.append((m, y, cw, ba, "action", "fullscreen"))
     draw_button(img, m + cw + gap, y, cw, ba, "Windowed", None, not state["fullscreen"])
-    ctrl_buttons.append((m + cw + gap, y, cw, ba, "action", "windowed"))
+    buttons.append((m + cw + gap, y, cw, ba, "action", "windowed"))
     y += ba + gap
 
     # Quit, full width.
     draw_button(img, m, y, W - 2 * m, ba, "Quit simulator", None, False, "quit")
-    ctrl_buttons.append((m, y, W - 2 * m, ba, "action", "quit"))
-    return img
+    buttons.append((m, y, W - 2 * m, ba, "action", "quit"))
+    return img, buttons
 
 
-def on_mouse(event, x, y, flags, param):
-    '''CONTROLS-window click handler — flip a toggle or fire an action into `state`.'''
-    if event != cv.EVENT_LBUTTONDOWN:
-        return
-    for (bx, by, bw, bh, kind, name) in ctrl_buttons:
+def render_control_bar(width, live):
+    '''Render a short, full-width control strip for fullscreen mode.
+
+    The buttons are laid out horizontally (6 toggles on top, the 3 actions
+    below) so the bar stays thin — it is stacked *below* the fluoro video rather
+    than covering it. Returns (image, buttons) with hit-boxes relative to the
+    bar's top-left.
+    '''
+    pad, gap, bh = 6, 6, 34
+    bar_h = pad + bh + gap + bh + pad
+    img = np.full((bar_h, width, 3), C_BG, np.uint8)
+    cv.line(img, (0, 0), (width, 0), C_BTN_BD, 1, cv.LINE_AA)  # top divider
+    buttons = []
+
+    # Row 1 — the six toggles. Single-line labels; the green highlight (not an
+    # ON/OFF caption) signals state, which keeps the bar thin.
+    toggles = [("Subtraction", "subtract"), ("Overlay", "overlay"),
+               ("Equalize", "equalize"), ("HUD", "hud"),
+               ("Pedal mode", "pedal_mode"), ("Pedal press", "pedal_pressed")]
+    cw = (width - 2 * pad - 5 * gap) // 6
+    y = pad
+    for i, (label, key) in enumerate(toggles):
+        bx = pad + i * (cw + gap)
+        on = bool(state[key])
+        draw_button(img, bx, y, cw, bh, label, None, on)
+        buttons.append((bx, y, cw, bh, "toggle", key))
+
+    # Row 2 — Fullscreen / Windowed / Quit.
+    y += bh + gap
+    aw = (width - 2 * pad - 2 * gap) // 3
+    draw_button(img, pad, y, aw, bh, "Fullscreen", None, state["fullscreen"])
+    buttons.append((pad, y, aw, bh, "action", "fullscreen"))
+    draw_button(img, pad + aw + gap, y, aw, bh, "Windowed", None, not state["fullscreen"])
+    buttons.append((pad + aw + gap, y, aw, bh, "action", "windowed"))
+    draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Quit simulator", None, False, "quit")
+    buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "quit"))
+    return img, buttons
+
+
+def apply_button(kind, name):
+    '''Apply a button press to the shared `state` dict (toggles flip, actions set).'''
+    if kind == "toggle":
+        state[name] = not state[name]
+    elif name == "fullscreen":
+        state["fullscreen"] = True
+    elif name == "windowed":
+        state["fullscreen"] = False
+    elif name == "quit":
+        state["quit"] = True
+
+
+def _hit(buttons, x, y):
+    '''Return the (kind, name) of the button containing (x, y), or None.'''
+    for (bx, by, bw, bh, kind, name) in buttons:
         if bx <= x < bx + bw and by <= y < by + bh:
-            if kind == "toggle":
-                state[name] = not state[name]
-            elif name == "fullscreen":
-                state["fullscreen"] = True
-            elif name == "windowed":
-                state["fullscreen"] = False
-            elif name == "quit":
-                state["quit"] = True
-            break
+            return kind, name
+    return None
+
+
+def on_mouse_controls(event, x, y, flags, param):
+    '''Click handler for the separate CONTROLS window (windowed mode).'''
+    if event == cv.EVENT_LBUTTONDOWN:
+        hit = _hit(ctrl_buttons, x, y)
+        if hit:
+            apply_button(*hit)
+
+
+def on_mouse_fluoro(event, x, y, flags, param):
+    '''Click handler for buttons overlaid on the FLUORO frame (fullscreen mode).'''
+    if event == cv.EVENT_LBUTTONDOWN:
+        hit = _hit(overlay_buttons, x, y)
+        if hit:
+            apply_button(*hit)
 
 
 def create_capture(source=0):
@@ -349,14 +415,20 @@ if __name__ == '__main__':
     # fullscreen; WINDOW_KEEPRATIO preserves the camera's aspect ratio on resize.
     cv.namedWindow("FLUORO", cv.WND_PROP_FULLSCREEN)
     cv.setWindowProperty("FLUORO", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
+    # Clicks on the FLUORO window only do anything in fullscreen, where the
+    # control buttons are composited onto the frame (see overlay_buttons).
+    cv.setMouseCallback("FLUORO", on_mouse_fluoro)
 
     # ── Control panel window ──────────────────────────────────────────────────
-    # A separate, auto-sized window holding the logo + clickable buttons. Clicks
-    # are routed through on_mouse into the shared `state` dict; the FLUORO window
-    # stays a clean simulation view.
-    cv.namedWindow("CONTROLS", cv.WINDOW_AUTOSIZE)
-    cv.setMouseCallback("CONTROLS", on_mouse)
-    cv.moveWindow("CONTROLS", 20, 20)
+    # A separate, auto-sized window holding the logo + clickable buttons, shown
+    # in windowed mode. In fullscreen it is closed and the buttons move onto the
+    # FLUORO frame instead. Clicks route through on_mouse_controls into `state`.
+    def show_controls_window():
+        cv.namedWindow("CONTROLS", cv.WINDOW_AUTOSIZE)
+        cv.setMouseCallback("CONTROLS", on_mouse_controls)
+        cv.moveWindow("CONTROLS", 20, 20)
+
+    show_controls_window()
     logo = cv.imread(LOGO_IMAGE, cv.IMREAD_UNCHANGED)
     if logo is None:
         print("Warning: logo not found at", LOGO_IMAGE)
@@ -457,6 +529,7 @@ if __name__ == '__main__':
     background = None
     applied_fullscreen = None  # last fullscreen state pushed to the FLUORO window
     live = False               # True once a frame has been read (drives the status dot)
+    res = None                 # latest processed frame to display
 
     # Learning rate for cv.accumulateWeighted: background = (1-alpha)*background + alpha*frame
     # 0.05 means the background adapts slowly — a new object takes ~20 frames to be absorbed.
@@ -478,11 +551,20 @@ if __name__ == '__main__':
         key_pedal = (key == ord('b'))
         pedal_down = state["pedal_pressed"] or key_pedal
 
-        # Keep the FLUORO window's fullscreen state in sync with the toggle.
+        # Keep the FLUORO window's fullscreen state in sync with the toggle, and
+        # move the controls between the separate CONTROLS window (windowed) and a
+        # fullscreen overlay on the FLUORO frame.
         if state["fullscreen"] != applied_fullscreen:
             cv.setWindowProperty(
                 "FLUORO", cv.WND_PROP_FULLSCREEN,
                 cv.WINDOW_FULLSCREEN if state["fullscreen"] else cv.WINDOW_NORMAL)
+            if state["fullscreen"]:
+                # Buttons overlay the fluoro image — drop the separate window.
+                cv.destroyWindow("CONTROLS")
+            else:
+                # Back to windowed — restore the separate control panel window.
+                show_controls_window()
+                overlay_buttons[:] = []
             applied_fullscreen = state["fullscreen"]
 
         # ── Drain completed frames from the thread pool ───────────────────────
@@ -508,9 +590,7 @@ if __name__ == '__main__':
             # Show "PEDAL ACTIVE" near the bottom when the pedal is pressed
             if pedal_down:
                 draw_str(res, (20, 450), "PEDAL ACTIVE")
-
-            # Push the finished frame to the display window
-            cv.imshow("FLUORO", res)
+            # `res` is displayed below (clean, or with the fullscreen overlay).
 
         # ── Capture and submit a new frame ────────────────────────────────────
         # Only submit a new frame if the pool has room (queue shorter than thread count).
@@ -581,10 +661,27 @@ if __name__ == '__main__':
 
                 pending.append(task)
 
-        # ── Refresh the control panel ──────────────────────────────────────────
-        # Rendered every iteration so the button states track the keyboard and the
-        # status dot reflects whether a live frame is flowing.
-        cv.imshow("CONTROLS", render_controls(logo, live))
+        # ── Display: fluoro view + controls ────────────────────────────────────
+        # Windowed: the fluoro view stays clean and the vertical panel lives in
+        # its own CONTROLS window. Fullscreen: stack the video on top and a thin
+        # control bar below it (so the controls never cover the video), shown as
+        # one composited image in the FLUORO window.
+        if state["fullscreen"]:
+            if res is not None:
+                vid = cv.cvtColor(res, cv.COLOR_GRAY2BGR) if res.ndim == 2 else res
+                bar, bbtns = render_control_bar(vid.shape[1], live)
+                composite = np.vstack([vid, bar])
+                # Offset the bar's hit-boxes by the video height so clicks on the
+                # fullscreen window land on the right buttons.
+                overlay_buttons[:] = [(x, y + vid.shape[0], w, h, k, n)
+                                      for (x, y, w, h, k, n) in bbtns]
+                cv.imshow("FLUORO", composite)
+        else:
+            panel, btns = render_controls(logo, live)
+            ctrl_buttons[:] = btns
+            cv.imshow("CONTROLS", panel)
+            if res is not None:
+                cv.imshow("FLUORO", res)
 
         # ── Keyboard shortcut handling ─────────────────────────────────────────
         # Second waitKey call at the bottom of the loop catches presses that
